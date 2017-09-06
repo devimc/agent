@@ -1137,6 +1137,58 @@ func newContainerCb(pod *pod, data []byte) error {
 	return nil
 }
 
+func waitForContainerWorkload(c libcontainer.Container) {
+	sigCgtTag := "SigCgt:"
+	maxTries := 5
+
+	pids, err := c.Processes()
+	if err != nil {
+		agentLog.Errorf("wait for container workload unable to get container processes: %s", err)
+		return
+	}
+
+	if len(pids) == 0 {
+		return
+	}
+
+	getSigCgt := func() (string, error) {
+		statusPath := fmt.Sprintf("/proc/%d/status", pids[0])
+		statusContent, err := ioutil.ReadFile(statusPath)
+		if err != nil {
+			return "", fmt.Errorf("unable to read %s: %s", statusPath, err)
+		}
+
+		status := string(statusContent)
+
+		begin := strings.Index(status, sigCgtTag)
+		if begin == -1 {
+			return "", fmt.Errorf("unable to find tag %s in %s", sigCgtTag, status)
+		}
+
+		begin += len(sigCgtTag)
+		end := strings.Index(status[begin:], "\n")
+
+		return strings.TrimSpace(status[begin : begin+end]), nil
+	}
+
+	for i := 0; i < maxTries; i++ {
+		signalsCgt, err := getSigCgt()
+		if err != nil {
+			agentLog.Errorf("failed to wait for container workload: %s", err)
+			return
+		}
+
+		for _, c := range signalsCgt {
+			if string(c) != "0" {
+				return
+			}
+		}
+
+		_, _, _ = syscall.RawSyscall(syscall.SYS_SCHED_YIELD, 0, 0, 0)
+		time.Sleep(time.Millisecond * 200)
+	}
+}
+
 func killContainerCb(pod *pod, data []byte) error {
 	var payload hyper.KillContainer
 
@@ -1153,6 +1205,11 @@ func killContainerCb(pod *pod, data []byte) error {
 	if ctr == nil {
 		return fmt.Errorf("Container %s not found, impossible to signal", payload.ID)
 	}
+
+	// container creation (newcontainer) does not guarantee the execution of the workload
+	// we have to wait a bit before send any signal
+	// https://github.com/clearcontainers/runtime/issues/430
+	waitForContainerWorkload(pod.containers[payload.ID].container)
 
 	// Use AllProcesses to make sure we carry forward the flag passed by the runtime.
 	if err := ctr.container.Signal(payload.Signal, payload.AllProcesses); err != nil {
